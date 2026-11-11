@@ -56,6 +56,13 @@ def build_response(extraction, filename, include_raw=False):
     if kind == "tax_invoice":
         for key in ("invoice_number", "invoice_date", "supplier", "taxable_amount", "gst_amount", "cgst", "sgst", "igst", "round_off", "subtotal", "invoice_total", "item_count"):
             fields[key] = financial.get(key)
+    if kind != "tax_invoice":
+        for kv in extraction.get("key_value_pairs", []):
+            key = re.sub(r"[^a-z0-9]+", "_", kv["label"].lower()).strip("_")
+            if key and key not in fields:
+                fields[key] = kv["value"]
+        warnings = [w for w in warnings if not w.startswith("No verified structured extractor")]
+        warnings.append("Fields are generic label/value pairs detected from the document layout; no category-specific validation was applied")
     data = {
         "document": {"filename": filename, "page_count": len(pages)},
         "document_metadata": {

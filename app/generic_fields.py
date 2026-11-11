@@ -127,10 +127,33 @@ def _aligned(label, value):
 _PARTY = re.compile(r'^(?:buyer|bill\s*to|ship\s*to|consignee|seller|sold\s*to|billed\s*to|shipped\s*to)\b', re.I)
 
 
-def layout_key_values(words, page_number):
+def two_column_blocks(cells_rows, page_number):
+    """Runs of >=3 consecutive rows made of exactly [label | value] with labels left-aligned,
+    e.g. 'Member Id   11987'. Returns (pairs, indexes of rows consumed)."""
+    def is_pair(cells):
+        return (len(cells) == 2 and re.match(r"^[A-Za-z][A-Za-z0-9 /&.()'#%-]{1,39}$", cells[0][2].strip())
+                and len(cells[0][2].split()) <= 5 and len(cells[1][2]) <= 120 and cells[1][0] > cells[0][1])
+    pairs, used, i = [], set(), 0
+    while i < len(cells_rows):
+        j = i
+        while j < len(cells_rows) and is_pair(cells_rows[j]) and abs(cells_rows[j][0][0] - cells_rows[i][0][0]) <= 6:
+            j += 1
+        if j - i >= 3:
+            for k in range(i, j):
+                pairs.append({'label': _clean(cells_rows[k][0][2]), 'value': _clean(cells_rows[k][1][2]), 'page': page_number})
+                used.add(k)
+            i = j
+        else:
+            i += 1
+    return pairs, used
+
+
+def layout_key_values(words, page_number, skip=frozenset()):
     rows = _cells_from_words(words)
     results = []
     for i, cells in enumerate(rows):
+        if i in skip:
+            continue
         nxt = rows[i + 1] if i + 1 < len(rows) else []
         # 1. Label row above value row (e.g. 'Invoice No.   Dated' over 'GST/263/25-26   1-Sep-25').
         if 2 <= len(cells) <= 4 and all(_label_like(c[2]) for c in cells):
@@ -162,8 +185,11 @@ def layout_key_values(words, page_number):
 
 
 def key_values_from_words(words, page_number):  # noqa: F811  (supersedes the colon-only version above)
+    text_rows, cell_rows = _rows_from_words(words), _cells_from_words(words)
+    block_pairs, used = two_column_blocks(cell_rows, page_number)
+    rest = [t for idx, t in enumerate(text_rows) if idx not in used]
     seen, out = set(), []
-    for kv in extract_key_values(_rows_from_words(words), page_number) + layout_key_values(words, page_number):
+    for kv in block_pairs + extract_key_values(rest, page_number) + layout_key_values(words, page_number, used):
         key = (kv['label'].lower(), kv['value'].lower())
         if key not in seen:
             seen.add(key); out.append(kv)
@@ -176,6 +202,6 @@ def supplier_from_signature(words):
     for row in _rows_from_words(words):
         for cell in re.split(r'\s{3,}', row):
             m = re.match(r"^for\s+([A-Za-z][\w&.,' -]{2,70}?)(?:\s+from\s+\d.*)?[:.]*$", cell.strip(), re.I)
-            if m and not re.search(r'(?:recipient|customer|office|details)', m.group(1), re.I):
+            if m and not re.search(r'\b(?:recipient|customer|office|details)\b', m.group(1), re.I):
                 found = m.group(1).strip(' .,')
     return found

@@ -10,4 +10,6 @@ def classify(text):
         return "credit_arrangement_letter"
     if re.search(r"\b(?:sanction letter|sanctioned limit)\b", sample, re.I):
         return "sanction_letter"
+    if re.search(r"\btrade confirmation\b", sample, re.I):
+        return "trade_confirmation"
     return "unknown"
