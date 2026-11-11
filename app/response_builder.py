@@ -60,14 +60,34 @@ def build_response(extraction, filename, include_raw=False):
                 n += 1
                 key = f"{base}_{n}"
             fields[key] = kv["value"]
-        tables = [{"table_name": f"{t.get('type', 'table')}_{i}", "page": t.get("page"), "rows": _rows_to_objects(t.get("rows", []))} for i, t in enumerate(extraction.get("tables", []), 1)]
+        # Tables rebuilt from word positions (column titles joined across heading lines) come first;
+        # a ruled grid from the PDF is added only for pages where no such table was found.
+        generic = extraction.get("generic_tables", [])
+        tables = [{"table_name": f"table_{i}", "page": t["page"], "columns": t["columns"], "rows": t["rows"]} for i, t in enumerate(generic, 1)]
+        covered = {t["page"] for t in generic}
+        for t in extraction.get("tables", []):
+            if t.get("page") not in covered:
+                tables.append({"table_name": f"table_{len(tables) + 1}", "page": t.get("page"), "rows": _rows_to_objects(t.get("rows", []))})
+    generic_sender = generic_title = generic_date = None
+    if kind != "tax_invoice":
+        from app.financial import DATE, valid_date
+        title_lines = extraction.get("headings", [])
+        generic_sender = title_lines[0] if title_lines else None
+        generic_title = " - ".join(title_lines[1:]) or None
+        for kv in all_fields:
+            if re.search(r"\bdate\b|\bdated\b", kv["label"], re.I) and not re.search(r"due|expiry|maturity|reversal|settlement|value\s*date", kv["label"], re.I):
+                m = DATE.search(kv["value"])
+                generic_date = valid_date(m.group()) if m else None
+                if generic_date:
+                    break
     data = {
         "document": {"filename": filename, "page_count": len(pages)},
         "document_metadata": {
             "document_category": kind,
-            "sender": financial.get("supplier") if kind == "tax_invoice" else None,
+            "title": None if kind == "tax_invoice" else generic_title,
+            "sender": financial.get("supplier") if kind == "tax_invoice" else generic_sender,
             "counterparty_or_bp": financial.get("buyer") if kind == "tax_invoice" else None,
-            "document_date": financial.get("invoice_date") if kind == "tax_invoice" else None,
+            "document_date": financial.get("invoice_date") if kind == "tax_invoice" else generic_date,
         },
         "extracted_fields": fields,
         "tables": tables,

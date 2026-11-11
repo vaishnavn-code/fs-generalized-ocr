@@ -115,3 +115,21 @@ def test_tax_label_needs_its_own_amount():
     assert 'cgst' not in totals and 'sgst' not in totals
     assert extract_totals(row(10, (10, 'CGST'), (60, '126.00')))['cgst'] == 126.0
     assert extract_totals(row(10, (10, 'CGST'), (60, '9'), (70, '%'), (100, '126.00')))['cgst'] == 126.0
+
+
+def test_table_without_grid_and_two_line_headings():
+    """Any report: column titles on two lines, one title cell spanning two columns, no ruled lines."""
+    from app.generic_tables import detect_tables
+    def row(y, *cells):
+        words = []
+        for x, text in cells:
+            for part in text.split(' '):
+                words.append((x, y, x + 5 * len(part), y + 8, part, y, 0, 0)); x += 5 * len(part) + 3
+        return words
+    words = (row(10, (18, 'Sr. Trade Ref'), (150, 'Order'), (250, 'Amount'))
+             + row(20, (18, 'No.'), (150, 'Type'), (250, '(Cr.)'))
+             + row(40, (20, '1'), (40, 'TREP/150626'), (150, 'Borrow'), (250, '100.00'))
+             + row(52, (20, '2'), (40, 'TREP/150626'), (150, 'Borrow'), (255, '40.00')))
+    table = detect_tables(words, 1)[0]
+    assert table['columns'] == ['Sr. No.', 'Trade Ref', 'Order Type', 'Amount (Cr.)']
+    assert table['rows'][1] == {'sr_no': '2', 'trade_ref': 'TREP/150626', 'order_type': 'Borrow', 'amount_cr': '40.00'}

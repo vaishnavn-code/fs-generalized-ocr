@@ -14,6 +14,7 @@ from app.financial import (extract_metadata, extract_items, extract_totals, norm
                            totals_from_tables, extract_from_text, items_from_words, metadata_from_key_values, finalize_items, tax_summaries, tax_summary_from_words, _column_key)
 from app.parties import extract_parties, reference_grid
 from app.generic_fields import BOILERPLATE
+from app.generic_tables import detect_tables, headings
 
 MAX_PAGES = 5
 MIN_NATIVE_CHARS = 50      # below this a page is treated as fully scanned
@@ -263,8 +264,13 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
     # Only what the response actually returns counts as 'mapped': a raw grid that is replaced by invoice_items /
     # tax_summary is not returned, so its other cells must be covered by a field or be listed as unmapped.
     returned = [{'page': s['page'], 'rows': [list(r.keys()) + list(r.values()) for r in s['rows']]} for s in summaries]
+    # Any document: tables found from word positions alone (no grid needed), and the title lines.
+    generic_tables = [t for number, words in words_by_page.items() for t in detect_tables(words, number)]
+    title_lines = headings(words_by_page[1])
     if not items and not summaries:
         returned += tables   # non-invoice documents: detected tables are returned as they are
+        returned += [{'page': t['page'], 'rows': [t['columns']] + [list(r.values()) for r in t['rows']]} for t in generic_tables]
+        returned.append({'page': 1, 'rows': [title_lines]})
     party_text = ' '.join(str(v) for group in ('supplier', 'buyer', 'ship_to') for v in party[group].values())
     party_text += ' ' + ' '.join(grid_labels) + ' ' + ' '.join(str(v) for v in grid.values() if v)
     if party['supplier'].get('name_as_printed'): party_text += ' for'   # signature line 'for <company>'
@@ -280,7 +286,7 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
         'financial': financial, 'key_value_pairs': key_values,
         'status': 'completed', 'page_count': len(pages), 'pages': pages,
         'fields': {**fields_from_text('\n'.join(p['text'] for p in pages)), 'date': financial.get('invoice_date')},
-        'tables': tables, 'tax_summaries': summaries, 'warnings': warnings,
+        'tables': tables, 'tax_summaries': summaries, 'generic_tables': generic_tables, 'headings': title_lines, 'warnings': warnings,
         'unmapped_text': unmapped,
         'coverage': {'text_segments': total_cells, 'mapped_to_fields_or_tables': total_cells - len(unmapped), 'returned_as_unmapped_text': len(unmapped),
                      'of_which_headings_and_form_wording': form_wording},

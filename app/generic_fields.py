@@ -62,7 +62,7 @@ def _pairs_from_line(line):
         found = False
         for m in _PAIR.finditer(seg):
             label, value = _clean(m.group(1)), _clean(m.group(2))
-            if label and value and len(value) <= 200 and len(label.split()) <= 4:
+            if label and value and len(value) <= 200 and len(label.split()) <= 6:
                 pairs.append((label, value)); found = True
         if not found and ':' not in seg and i + 1 < len(merged):
             nxt = _clean(merged[i + 1])
@@ -212,7 +212,7 @@ _BARE_HEADING = re.compile(r'^(?:declaration|terms\s*(?:&|and)\s*conditions|note
 # Words that only structure the form. They carry no value of their own, so they are counted, not listed.
 BOILERPLATE = re.compile(r"^(?:(?:tax\s+)?invoice|authori[sz]ed\s+signator(?:y|ies)|(?:company'?s\s+)?bank\s+details|e\.?\s*&\s*o\.?\s*e\.?|"
                          r"sl\.?|sr\.?|s\.?\s*no\.?|no\.?|#|this\s+is\s+a\s+computer\s+generated\s+invoice\.?|original\s+for\s+recipient|"
-                         r"duplicate\s+for\s+transporter|triplicate\s+for\s+supplier|\(?original\)?|payment\s+information|tax\s+summary)$", re.I)
+                         r"-*\s*end\s+of\s+(?:report|document|statement)\s*-*|continued(?:\s+on\s+next\s+page)?\.*|duplicate\s+for\s+transporter|triplicate\s+for\s+supplier|\(?original\)?|payment\s+information|tax\s+summary)$", re.I)
 _TABLE_HEAD = re.compile(r'^(?:hsn|sac|#|sl\b|s\.?\s*no|item|description|particulars|qty|quantity|rate|taxable|cgst|sgst|igst|amount|total)', re.I)
 
 
