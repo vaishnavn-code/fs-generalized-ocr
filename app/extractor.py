@@ -11,8 +11,9 @@ import pytesseract
 from PIL import Image
 from app.generic_fields import key_values_from_words, supplier_from_signature, _rows_from_words, _cells_from_words, unmapped_cells
 from app.financial import (extract_metadata, extract_items, extract_totals, normalize_table, identify_table, validate,
-                           totals_from_tables, extract_from_text, items_from_words, metadata_from_key_values, finalize_items, tax_summaries, _column_key)
-from app.parties import extract_parties
+                           totals_from_tables, extract_from_text, items_from_words, metadata_from_key_values, finalize_items, tax_summaries, tax_summary_from_words, _column_key)
+from app.parties import extract_parties, reference_grid
+from app.generic_fields import BOILERPLATE
 
 MAX_PAGES = 5
 MIN_NATIVE_CHARS = 50      # below this a page is treated as fully scanned
@@ -226,10 +227,19 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
     financial['supplier_gstin'] = party['supplier'].get('gstin')
     financial['buyer'] = party['buyer'].get('name')
     financial['buyer_gstin'] = party['buyer'].get('gstin')
+    grid, grid_labels = reference_grid(words_by_page[1])
+    financial['reference_grid'] = grid
     summaries = tax_summaries(tables)
+    if not summaries:
+        for number, words in words_by_page.items():
+            summaries += tax_summary_from_words(words, number)
     for summary in summaries:   # CGST / SGST / IGST totals from the tax summary's TOTAL row
         for row in summary['rows']:
             if str(row.get('hsn_sac', '')).lower() != 'total': continue
+            if isinstance(row.get('taxable_amount'), float) and financial.get('taxable_amount') is None:
+                financial['taxable_amount'] = row['taxable_amount']   # printed on the document, so not a derived figure
+            if isinstance(row.get('total_tax'), float) and financial.get('gst_amount') is None:
+                financial['gst_amount'] = row['total_tax']
             for tax in ('cgst', 'sgst', 'igst'):
                 value = next((v for k, v in row.items() if tax in k and 'rate' not in k and isinstance(v, float)), None)
                 if value is not None and financial.get(tax) is None: financial[tax] = value
@@ -256,18 +266,24 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
     if not items and not summaries:
         returned += tables   # non-invoice documents: detected tables are returned as they are
     party_text = ' '.join(str(v) for group in ('supplier', 'buyer', 'ship_to') for v in party[group].values())
+    party_text += ' ' + ' '.join(grid_labels) + ' ' + ' '.join(str(v) for v in grid.values() if v)
+    if party['supplier'].get('name_as_printed'): party_text += ' for'   # signature line 'for <company>'
+    if party['supplier'].get('msme_udyam_no'): party_text += ' msme'
     returned.append({'page': 1, 'rows': [[party_text]]})
     unmapped = []
     for number, words in words_by_page.items():
         unmapped += unmapped_cells(words, number, key_values, returned, financial)
-    total_cells = sum(len(row) for words in words_by_page.values() for row in _cells_from_words(words))
+    all_cells = [c for words in words_by_page.values() for row in _cells_from_words(words) for c in row]
+    total_cells = len(all_cells)
+    form_wording = sum(1 for c in all_cells if BOILERPLATE.match(c[2].strip()) or (c[2].strip().endswith(':') and len(c[2]) <= 45))
     return {
         'financial': financial, 'key_value_pairs': key_values,
         'status': 'completed', 'page_count': len(pages), 'pages': pages,
         'fields': {**fields_from_text('\n'.join(p['text'] for p in pages)), 'date': financial.get('invoice_date')},
         'tables': tables, 'tax_summaries': summaries, 'warnings': warnings,
         'unmapped_text': unmapped,
-        'coverage': {'text_segments': total_cells, 'mapped_to_fields_or_tables': total_cells - len(unmapped), 'returned_as_unmapped_text': len(unmapped)},
+        'coverage': {'text_segments': total_cells, 'mapped_to_fields_or_tables': total_cells - len(unmapped), 'returned_as_unmapped_text': len(unmapped),
+                     'of_which_headings_and_form_wording': form_wording},
         'timings_ms': {k: round(v, 2) for k, v in timings.items()},
         'total_ms': round((time.perf_counter() - started) * 1000, 2),
     }

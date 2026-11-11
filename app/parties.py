@@ -11,6 +11,9 @@ SHIP_HEAD = re.compile(r'^(?:ship(?:ped)?\s*to|consignee|deliver(?:y|ed)?\s*(?:t
 PARTY_KEYS = [('gstin', r'gstin|gst\s*(?:no|in)\b'), ('pan', r'\bpan\b'), ('cin', r'\bcin\b'), ('email', r'e-?mail'),
               ('phone', r'phone|mobile|contact|\btel\b|\bmob\b'), ('state_code', r'^(?:state\s*)?code$'),
               ('state', r'^state(?:\s*name)?$'), ('website', r'website|\bweb\b')]
+UDYAM = re.compile(r'UDYAM-[A-Z]{2}-\d{2}-\d{6,7}')
+PARTY_LINE = re.compile(r'^(?:gstin|gst\s*no|state(?:\s*name)?|e-?mail|phone|mobile|contact|tel|pan|cin|website|web)\b[^:]{0,12}:', re.I)
+ADDRESS_LABEL = re.compile(r'^(?:(?:regd?|registered|sales|head|corporate|corp|branch|admin|factory|works)\.?\s*)?(?:office|off\.?|address|addr?\.?|add\.?|godown|warehouse|factory|works|unit|plot|shop|h\.?\s*o\.?)\b[^:]{0,20}:', re.I)
 ITEM_HEAD = re.compile(r'^(?:#|sl\.?\s*no\.?|s\.?\s*no\.?|item(?: name)?|description(?: of goods)?|particulars?|hsn\s*/?\s*sac|qty|quantity)$', re.I)
 
 
@@ -95,14 +98,74 @@ def extract_parties(words, supplier_name=None):
             hit = next((c for c in cells if target and re.sub(r'[^a-z0-9]', '', c[2].lower()).startswith(target)), None)
             if not hit:
                 continue
-            lines = []
-            for y2, cells2, _ in srows[i + 1:i + 5]:
+            if _clean(hit[2]).rstrip('. ') != supplier_name:
+                result['supplier']['name_as_printed'] = _clean(hit[2])
+            lines, last_y = [], y
+            for y2, cells2, _ in srows[i + 1:i + 10]:
                 c2 = next((c for c in cells2 if abs(c[0] - hit[0]) <= 12), None)
-                if c2 is None or ':' in c2[2] or GSTIN.search(c2[2].upper()) or BUYER_HEAD.match(c2[2]):
+                if c2 is None:
+                    continue
+                if y2 - last_y > (18 if lines else 32):   # the company name is often in a large font, so allow more under it
+                    break   # a visible gap: the address block has ended
+                last_y = y2
+                text = c2[2].strip()
+                if ':' in text and not ADDRESS_LABEL.match(text) and not UDYAM.search(text.upper()):
+                    break   # some other labelled field starts here
+                udyam = UDYAM.search(text.upper())
+                if udyam:
+                    result['supplier']['msme_udyam_no'] = udyam.group()
+                    continue
+                # A colon alone does not end the address: 'SALES OFFICE : OFFICE NO 2' is still address text.
+                if GSTIN.search(text.upper()) or BUYER_HEAD.match(text) or PARTY_LINE.match(text):
                     break
-                lines.append(c2[2])
+                lines.append(text)
             if lines: result['supplier']['address'] = _clean(', '.join(lines))
             break
     result['supplier'].update(fields)
     result['consumed'] += used
     return result
+
+
+# Reference grid printed by accounting packages: a small label with its value (often empty) on the line below.
+GRID_LABELS = {
+    'deliverynote': 'delivery_note', 'modetermsofpayment': 'payment_terms', 'referencenodate': 'reference_no_and_date',
+    'otherreferences': 'other_references', 'otherreference': 'other_references', 'buyersorderno': 'buyers_order_no',
+    'dispatchdocno': 'dispatch_doc_no', 'despatchdocumentno': 'dispatch_doc_no', 'deliverynotedate': 'delivery_note_date',
+    'dispatchedthrough': 'dispatched_through', 'despatchedthrough': 'dispatched_through', 'destination': 'destination',
+    'termsofdelivery': 'terms_of_delivery', 'suppliersref': 'suppliers_ref', 'supplierref': 'suppliers_ref',
+    'billofladinglrrrno': 'lr_rr_no', 'motorvehicleno': 'vehicle_no', 'ewaybillno': 'e_way_bill_no',
+}
+
+
+def _grid_key(text):
+    return GRID_LABELS.get(re.sub(r'[^a-z]', '', text.lower()))
+
+
+def reference_grid(words):
+    """Returns ({key: value or None}, [label texts]). A label with nothing printed under it is reported as null,
+    so the caller can see the field exists on the form and is empty, instead of finding the bare label in unmapped text."""
+    rows = _rows_with_y(words)
+    found, labels = {}, []
+    for i, (y, cells, _) in enumerate(rows):
+        for c in cells:
+            text = c[2].strip()
+            key = _grid_key(text)
+            if key is None and text.lower() == 'dated' and any(_grid_key(o[2]) == 'buyers_order_no' for o in cells):
+                key = 'buyers_order_date'
+            if key is None or key in found:
+                continue
+            values, last = [], y
+            for y2, cells2, _ in rows[i + 1:]:
+                if y2 - last > 14 or len(values) >= 3:
+                    break
+                below = next((o for o in cells2 if abs(o[0] - c[0]) <= 4), None)
+                if below is None:
+                    continue
+                if _grid_key(below[2]) or below[2].strip().lower() == 'dated':
+                    break
+                values.append(below[2].strip()); last = y2
+            found[key] = _clean(' '.join(values)) or None
+            labels.append(text)
+    if len(found) < 3:
+        return {}, []
+    return found, labels

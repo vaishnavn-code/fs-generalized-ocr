@@ -18,6 +18,8 @@ OTHER_KEYS = [('description', r'^description$'), ('terms_and_conditions', r'term
 NORMALISED = re.compile(r"^(?:(?:tax\s+)?(?:invoice|inv|bill)(?:\s*(?:no|number|num|#))?\.?|no\.?|invoice\s*date|date|sub\s*-?\s*total|"
                         r"total|grand\s*total|invoice\s*total|round(?:ed)?\s*off|taxable\s*(?:value|amount)|(?:c|s|i)gst\b.*|"
                         r"invoice\s*details|buyer.*|bill(?:ed)?\s*to|ship(?:ped)?\s*to|consignee)$", re.I)
+SUPPLIER_KEYS = [('pan', r"^(?:company'?s?\s*)?pan(?:\s*no\.?)?$"), ('vat_tin', r'vat\s*tin'), ('cst_no', r'cst\s*no'),
+                 ('msme_udyam_no', r'msme|udyam'), ('cin', r'^(?:company\s*)?cin\b')]
 ITEM_COLUMNS = ['description', 'hsn_sac', 'quantity', 'unit', 'unit_price', 'taxable_amount', 'gst_rate_percent', 'gst_amount', 'total_amount']
 
 
@@ -52,6 +54,10 @@ def build_invoice_view(extraction):
               'round_off': fin.get('round_off'), 'invoice_total': fin.get('invoice_total'), 'amount_in_words': None}
     bank, other, additional = {}, {}, {}
     supplier_norm = _norm(fin.get('supplier'))
+    supplier = dict(party['supplier'])
+    address_norm = _norm(supplier.get('address'))
+    grid = fin.get('reference_grid') or {}
+    from app.parties import _grid_key
     dates_seen = 0
     for kv in extraction.get('key_value_pairs', []):
         label, value = kv['label'].strip(), kv['value'].strip()
@@ -60,6 +66,13 @@ def build_invoice_view(extraction):
             continue
         if supplier_norm and _norm(label) and (_norm(label) in supplier_norm or supplier_norm in _norm(label)):
             continue   # the supplier's name line read as a label
+        if address_norm and _norm(label + value) in address_norm:
+            continue   # a line of the supplier's address that happens to contain a colon
+        if grid and (_grid_key(label) or low == 'dated' and dates_seen >= 1):
+            continue   # reported from the reference grid below
+        hit = next((key for key, pattern in SUPPLIER_KEYS if re.search(pattern, low)), None)
+        if hit:
+            supplier.setdefault(hit, value); continue
         if re.search(r'in\s*words', low):
             key = 'tax_amount_in_words' if re.search(r'\btax\b', low) else 'amount_in_words'
             if not totals.get(key): totals[key] = value
@@ -98,9 +111,12 @@ def build_invoice_view(extraction):
         while key in additional and additional[key] != value:
             n += 1; key = f'{base}_{n}'
         additional[key] = value
+    for key, value in grid.items():
+        if key == 'payment_terms' and invoice.get('payment_terms'): continue
+        invoice.setdefault(key, value)
     fields = {
         'invoice_details': invoice,
-        'supplier': party['supplier'],
+        'supplier': supplier,
         'buyer': party['buyer'],
         'ship_to': party['ship_to'],
         'totals': totals,

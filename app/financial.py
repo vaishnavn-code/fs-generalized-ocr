@@ -511,3 +511,44 @@ def tax_summaries(tables):
         if result:
             out.append({'page': table.get('page'), 'rows': result, 'source_type': table.get('type')})
     return out
+
+
+def tax_summary_from_words(words, page_number):
+    """HSN-wise tax summary read from text rows. Used when the PDF grid gives no usable table (accounting packages
+    print each column as one tall cell) and for OCR pages. Columns follow the standard order:
+    HSN/SAC, taxable value, then rate and amount per tax, then total tax; the Total row has no rates."""
+    from app.generic_fields import _rows_with_y
+    rows = _rows_with_y(words)
+    for i, (y, cells, _) in enumerate(rows):
+        texts = [clean(c[2]).lower() for c in cells]
+        if not any(re.fullmatch(r'hsn\s*/?\s*sac|hsn|sac', t) for t in texts) or any(re.search(ITEM_DESC, t) or t.startswith('quantity') for t in texts):
+            continue
+        head = ' '.join(texts + [clean(c[2]).lower() for _, cs, _ in rows[i + 1:i + 2] for c in cs])
+        if not re.search(r'cgst|sgst|igst|taxable', head):
+            continue
+        taxes = ['igst'] if 'igst' in head and 'cgst' not in head else ['cgst', 'sgst']
+        out = []
+        for y2, cells2, _ in rows[i + 1:]:
+            first = clean(cells2[0][2])
+            values = [clean(c[2]) for c in cells2[1:]]
+            is_data = bool(re.fullmatch(r'\d{4,8}|total', first, re.I)) and values and all(re.fullmatch(r'[\d,]+(?:\.\d+)?\s*%?', v) for v in values)
+            if not is_data:
+                if out: break
+                continue
+            nums = [number(v) for v in values]
+            entry = {'hsn_sac': first}
+            if len(nums) == 2 + 2 * len(taxes):
+                entry['taxable_amount'] = nums[0]
+                for n, tax in enumerate(taxes):
+                    entry[f'{tax}_rate'] = nums[1 + 2 * n]; entry[f'{tax}_amt'] = nums[2 + 2 * n]
+                entry['total_tax'] = nums[-1]
+            elif len(nums) == 2 + len(taxes):
+                entry['taxable_amount'] = nums[0]
+                for n, tax in enumerate(taxes): entry[f'{tax}_amt'] = nums[1 + n]
+                entry['total_tax'] = nums[-1]
+            else:
+                entry.update({f'value_{n + 1}': v for n, v in enumerate(nums)})
+            out.append(entry)
+        if out:
+            return [{'page': page_number, 'rows': out, 'source_type': 'text_rows'}]
+    return []

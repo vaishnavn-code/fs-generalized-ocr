@@ -46,7 +46,10 @@ def _pairs_from_line(line):
             tmp[-1] += ':'
             continue
         if c.startswith(':') and tmp:
-            tmp[-1] += ':'; c = c.lstrip(': ')
+            # ': value' printed in its own column belongs to the label on its left, even when the value has
+            # a further 'Label : value' inside it ('State Name' | ': Maharashtra, Code : 27').
+            tmp[-1] += ': ' + c.lstrip(': ')
+            continue
         tmp.append(c)
     # A cell ending in ':' takes the next cell as its value, unless that cell is itself a label (heading row).
     merged = []
@@ -140,7 +143,8 @@ def two_column_blocks(cells_rows, page_number):
             j += 1
         if j - i >= 3:
             for k in range(i, j):
-                pairs.append({'label': _clean(cells_rows[k][0][2]), 'value': _clean(cells_rows[k][1][2]), 'page': page_number})
+                # 'Label' and ': value' printed as two columns - the colon belongs to neither.
+                pairs.append({'label': _clean(cells_rows[k][0][2]).rstrip(' :'), 'value': _clean(cells_rows[k][1][2]).lstrip(': '), 'page': page_number})
                 used.add(k)
             i = j
         else:
@@ -204,6 +208,11 @@ def _rows_with_y(words):
     return out
 
 
+_BARE_HEADING = re.compile(r'^(?:declaration|terms\s*(?:&|and)\s*conditions|notes?|remarks?|narration)$', re.I)
+# Words that only structure the form. They carry no value of their own, so they are counted, not listed.
+BOILERPLATE = re.compile(r"^(?:(?:tax\s+)?invoice|authori[sz]ed\s+signator(?:y|ies)|(?:company'?s\s+)?bank\s+details|e\.?\s*&\s*o\.?\s*e\.?|"
+                         r"sl\.?|sr\.?|s\.?\s*no\.?|no\.?|#|this\s+is\s+a\s+computer\s+generated\s+invoice\.?|original\s+for\s+recipient|"
+                         r"duplicate\s+for\s+transporter|triplicate\s+for\s+supplier|\(?original\)?|payment\s+information|tax\s+summary)$", re.I)
 _TABLE_HEAD = re.compile(r'^(?:hsn|sac|#|sl\b|s\.?\s*no|item|description|particulars|qty|quantity|rate|taxable|cgst|sgst|igst|amount|total)', re.I)
 
 
@@ -215,10 +224,12 @@ def heading_values(words, page_number):
     for i, (y, cells, _) in enumerate(rows):
         for j, c in enumerate(cells):
             label = c[2].strip()
-            if not label.endswith(':') or not 4 <= len(label) <= 45 or ':' in label[:-1] or _PARTY.match(label):
-                continue
-            if j + 1 < len(cells) and not cells[j + 1][2].strip().endswith(':'):
-                continue  # the value is on the same row; the colon rules handle it
+            standalone = bool(_BARE_HEADING.match(label))   # 'Declaration' with its sentences underneath, no colon
+            if not standalone:
+                if not label.endswith(':') or not 4 <= len(label) <= 45 or ':' in label[:-1] or _PARTY.match(label):
+                    continue
+                if j + 1 < len(cells) and not cells[j + 1][2].strip().endswith(':'):
+                    continue  # the value is on the same row; the colon rules handle it
             lines, last_y = [], y
             for y2, _, ws in rows[i + 1:]:
                 if y2 - last_y > 26 or len(lines) >= 4:
@@ -292,7 +303,7 @@ def unmapped_cells(words, page_number, key_values, tables, financial=None):
                     used.update(_tokens(value))
     for key in ('supplier', 'invoice_number'):
         used.update(_tokens((financial or {}).get(key)))
-    for key in ('taxable_amount', 'gst_amount', 'cgst', 'sgst', 'igst', 'round_off', 'subtotal', 'invoice_total'):
+    for key in ('taxable_amount', 'gst_amount', 'cgst', 'sgst', 'igst', 'round_off', 'subtotal', 'invoice_total', 'total_quantity'):
         value = (financial or {}).get(key)
         if isinstance(value, (int, float)):
             used.update(_tokens(f'{abs(value):.2f}')); used.update(_tokens(key.replace('_amount', '')))
@@ -308,7 +319,7 @@ def unmapped_cells(words, page_number, key_values, tables, financial=None):
                 continue
             if all(t in used for t in toks) or (has_items and _column_key(text)):
                 continue
-            if text.strip().endswith(':') and len(text) <= 45:   # a section heading with nothing of its own to report
+            if (text.strip().endswith(':') and len(text) <= 45) or BOILERPLATE.match(text.strip()):   # heading / form wording with nothing of its own to report
                 continue
             out.append({'page': page_number, 'text': _clean(text)})
     return out
