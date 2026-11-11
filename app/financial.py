@@ -81,8 +81,8 @@ def extract_metadata(page):
     supplier = None
     for line in lines:
         s=clean(' '.join(w[4] for w in line))
-        if s.lower().startswith('spontak supplies private limited') or s.lower().startswith('rm infotech'):
-            supplier=s.split('REGD.')[0].strip(); break
+        if s and not re.search(r'^(?:tax invoice|invoice|bill to|ship to|original for|duplicate|page\s+\d)', s, re.I) and not re.search(r'\b(?:GSTIN|phone|email|invoice details|date:)\b', s, re.I) and len(s) < 110:
+            supplier=s.split('REGD.')[0].strip().rstrip(' .'); break
     if not supplier:
         # Conservative fallback: first non-title line; may require review.
         for line in lines:

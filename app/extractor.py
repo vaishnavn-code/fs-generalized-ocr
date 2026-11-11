@@ -69,7 +69,7 @@ def extract_pdf(pdf_bytes, dpi=150):
     return {
         'financial': financial,
         'status': 'completed', 'page_count': len(pages), 'pages': pages,
-        'fields': fields_from_text('\n'.join(p['text'] for p in pages)),
+        'fields': {**fields_from_text('\n'.join(p['text'] for p in pages)), 'date': financial.get('invoice_date')},
         'tables': tables, 'warnings': ['Scanned table cell reconstruction is not implemented in this POC'] if any(p['source'] == 'ocr' for p in pages) else [],
         'timings_ms': {k: round(v, 2) for k, v in timings.items()},
         'total_ms': round((time.perf_counter() - started) * 1000, 2),
