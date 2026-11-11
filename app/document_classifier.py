@@ -8,6 +8,8 @@ def classify(text):
         return "tax_invoice"
     if re.search(r"\b(?:credit arrangement letter|CAL)\b", sample, re.I) and re.search(r"\b(?:facility|drawdown|borrower)\b", sample, re.I):
         return "credit_arrangement_letter"
+    if re.search(r"\bdrawdown\b", sample, re.I) and re.search(r"\b(?:drawdown\s+(?:request|date|amount|notice)|wish\s+to\s+draw)", sample, re.I):
+        return "drawdown_request"
     if re.search(r"\b(?:sanction letter|sanctioned limit)\b", sample, re.I):
         return "sanction_letter"
     if re.search(r"\b(?:all\s+)?trades?\s+report\b|\bdeal\s+report\b", sample, re.I):

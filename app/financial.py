@@ -19,7 +19,7 @@ def clean(value):
 
 def valid_date(value):
     if not value: return None
-    for fmt in ('%d/%m/%Y','%d-%m-%Y','%d.%m.%Y','%d/%m/%y','%d-%m-%y','%d.%m.%y','%d-%b-%y','%d-%b-%Y','%d %b %Y','%d %b %y','%d-%B-%Y','%d-%B-%y','%d %B %Y','%d %B %y','%Y-%m-%d','%d/%b/%Y','%d/%b/%y'):
+    for fmt in ('%d/%m/%Y','%d-%m-%Y','%d.%m.%Y','%d/%m/%y','%d-%m-%y','%d.%m.%y','%d-%b-%y','%d-%b-%Y','%d %b %Y','%d %b %y','%d-%B-%Y','%d-%B-%y','%d %B %Y','%d %B %y','%Y-%m-%d','%d/%b/%Y','%d/%b/%y','%d %B, %Y','%d %b, %Y'):
         try: return datetime.strptime(value.strip(), fmt).date().isoformat()
         except ValueError: pass
     return None

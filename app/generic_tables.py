@@ -107,7 +107,9 @@ def headings(words, limit=5):
     for y, cells, _ in _rows_with_y(words):
         if all(_SEPARATOR.match(c[2]) for c in cells):
             continue
-        if len(cells) != 1 or ':' in cells[0][2] or len(lines) >= limit:
+        from app.letters import _parse_date
+        text = cells[0][2].strip()
+        if len(cells) != 1 or ':' in text or len(lines) >= limit or _parse_date(text) or re.fullmatch(r'to\s*,?', text, re.I):
             break
         lines.append(_clean(cells[0][2]))
     return lines

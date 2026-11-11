@@ -15,6 +15,7 @@ from app.financial import (extract_metadata, extract_items, extract_totals, norm
 from app.parties import extract_parties, reference_grid
 from app.generic_fields import BOILERPLATE
 from app.generic_tables import detect_tables, headings
+from app.letters import letter_parts, split_letterhead, paragraphs, SALUTATION
 
 MAX_PAGES = 5
 MIN_NATIVE_CHARS = 50      # below this a page is treated as fully scanned
@@ -139,6 +140,40 @@ def _overlaps_native(word, native):
     return any(n[0] - 1 <= cx <= n[2] + 1 and n[1] - 1 <= cy <= n[3] + 1 for n in native)
 
 
+def straighten(words):
+    """For a scanned page: undo the tilt of the scan and put the words of each printed line on one common line.
+    A scan tilted by one degree moves the right end of a line several points up or down, which splits one printed
+    line into two 'rows' and separates a label from its value. The tilt is the angle that gives the fewest rows."""
+    if len(words) < 8:
+        return words
+    xc = np.array([(w[0] + w[2]) / 2 for w in words]); yc = np.array([(w[1] + w[3]) / 2 for w in words])
+    height = float(np.median([w[3] - w[1] for w in words]))
+
+    def row_count(slope):
+        ys = np.sort(yc + xc * slope)
+        return int(np.sum(np.diff(ys) > 2.5)) + 1
+
+    best, best_rows = 0.0, row_count(0.0)
+    for slope in np.tan(np.radians(np.arange(-3.0, 3.01, 0.1))):
+        rows = row_count(slope)
+        if rows < best_rows or (rows == best_rows and abs(slope) < abs(best)):
+            best, best_rows = float(slope), rows
+    shifted = sorted(((yc[i] + xc[i] * best, i) for i in range(len(words))))
+    lines, start = [[shifted[0]]], shifted[0][0]
+    for item in shifted[1:]:
+        if item[0] - lines[-1][-1][0] > max(2.6, 0.4 * height) or item[0] - start > 0.8 * height:
+            lines.append([item]); start = item[0]
+        else:
+            lines[-1].append(item)
+    out = list(words)
+    for line in lines:
+        centre = float(np.median([y for y, _ in line]))
+        for _, i in line:
+            w = words[i]; half = (w[3] - w[1]) / 2
+            out[i] = (w[0], centre - half, w[2], centre + half, *w[4:])
+    return out
+
+
 def page_words(page, dpi=OCR_DPI):
     """Returns (words, source, info). source: digital | ocr | digital+ocr."""
     native = page.get_text('words')
@@ -161,6 +196,11 @@ def page_words(page, dpi=OCR_DPI):
     if extra:
         info.update(ocr_word_count=len(extra), ocr_regions=len(regions), ocr_confidence=round(sum(c for c in confs if c) / max(1, len(confs)), 1))
         return list(native) + extra, 'digital+ocr', info
+    # A page that is one big picture with text over it is a scan that already carries an OCR text layer
+    # (made by the scanner or a PDF tool). Its text is used as it is, but its geometry needs straightening.
+    area = page.rect.width * page.rect.height
+    if any((fitz.Rect(i['bbox']) & page.rect).get_area() >= 0.7 * area for i in page.get_image_info()):
+        return straighten(list(native)), 'scanned_with_text_layer', info
     return list(native), 'digital', info
 
 
@@ -169,7 +209,7 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
     pages, tables, timings = [], [], {'native_ms': 0.0, 'ocr_ms': 0.0, 'tables_ms': 0.0}
     metadata, totals, key_values, warnings = {}, {}, [], []
     signature_supplier = None
-    words_by_page = {}
+    words_by_page, page_heights = {}, {}
     with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
         if doc.needs_pass:
             raise ValueError('Password-protected PDFs are not supported')
@@ -181,9 +221,11 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
             t = time.perf_counter()
             words, source, info = page_words(page, dpi)
             elapsed = (time.perf_counter() - t) * 1000
-            timings['ocr_ms' if source != 'digital' else 'native_ms'] += elapsed
+            timings['ocr_ms' if source in ('ocr', 'digital+ocr') else 'native_ms'] += elapsed
             words_by_page[number] = words
             text = page.get_text('text', sort=True) if source == 'digital' else '\n'.join(_rows_from_words(words))
+            if number == 1: first_page_height = page.rect.height
+            page_heights[number] = page.rect.height
             if number == 1:
                 metadata = extract_metadata(words, page.rect.width, page.rect.height, text)
                 totals = extract_totals(words)
@@ -218,6 +260,9 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
         if not items and o_items:
             items = o_items
         for p in ocr_pages:
+            if p['source'] == 'scanned_with_text_layer':
+                warnings.append(f"Page {p['page']}: this is a scan with an OCR text layer already in the PDF; values come from that layer and may contain OCR misreads")
+                continue
             what = 'the whole page' if p['source'] == 'ocr' else f"{p['ocr_regions']} image region(s)"
             warnings.append(f"Page {p['page']}: text was read by OCR from {what} (mean confidence {p['ocr_confidence']}); verify OCR-derived values")
     if signature_supplier:
@@ -267,10 +312,11 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
     # Any document: tables found from word positions alone (no grid needed), and the title lines.
     generic_tables = [t for number, words in words_by_page.items() for t in detect_tables(words, number)]
     title_lines = headings(words_by_page[1])
+    letter, letter_text = letter_parts(words_by_page[1], first_page_height)
     if not items and not summaries:
         returned += tables   # non-invoice documents: detected tables are returned as they are
         returned += [{'page': t['page'], 'rows': [t['columns']] + [list(r.values()) for r in t['rows']]} for t in generic_tables]
-        returned.append({'page': 1, 'rows': [title_lines]})
+        returned.append({'page': 1, 'rows': [title_lines, letter_text]})
     party_text = ' '.join(str(v) for group in ('supplier', 'buyer', 'ship_to') for v in party[group].values())
     party_text += ' ' + ' '.join(grid_labels) + ' ' + ' '.join(str(v) for v in grid.values() if v)
     if party['supplier'].get('name_as_printed'): party_text += ' for'   # signature line 'for <company>'
@@ -278,7 +324,14 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
     returned.append({'page': 1, 'rows': [[party_text]]})
     unmapped = []
     for number, words in words_by_page.items():
-        unmapped += unmapped_cells(words, number, key_values, returned, financial)
+        unmapped += [u for u in unmapped_cells(words, number, key_values, returned, financial) if not SALUTATION.match(u['text'])]
+    # Leftover text: lines repeated on every page are the letterhead; the rest is joined into paragraphs.
+    by_page = {}
+    for u in unmapped:
+        by_page.setdefault(u['page'], []).append(u)
+    letterhead, body = split_letterhead(by_page, page_heights)
+    text_content = paragraphs(body)
+    unmapped = [{'page': u['page'], 'text': u['text']} for u in unmapped]
     all_cells = [c for words in words_by_page.values() for row in _cells_from_words(words) for c in row]
     total_cells = len(all_cells)
     form_wording = sum(1 for c in all_cells if BOILERPLATE.match(c[2].strip()) or (c[2].strip().endswith(':') and len(c[2]) <= 45))
@@ -286,7 +339,8 @@ def extract_pdf(pdf_bytes, dpi=OCR_DPI):
         'financial': financial, 'key_value_pairs': key_values,
         'status': 'completed', 'page_count': len(pages), 'pages': pages,
         'fields': {**fields_from_text('\n'.join(p['text'] for p in pages)), 'date': financial.get('invoice_date')},
-        'tables': tables, 'tax_summaries': summaries, 'generic_tables': generic_tables, 'headings': title_lines, 'warnings': warnings,
+        'tables': tables, 'tax_summaries': summaries, 'generic_tables': generic_tables, 'headings': title_lines, 'letter': letter,
+        'letterhead': letterhead, 'text_content': text_content, 'warnings': warnings,
         'unmapped_text': unmapped,
         'coverage': {'text_segments': total_cells, 'mapped_to_fields_or_tables': total_cells - len(unmapped), 'returned_as_unmapped_text': len(unmapped),
                      'of_which_headings_and_form_wording': form_wording},

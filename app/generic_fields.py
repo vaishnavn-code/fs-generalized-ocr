@@ -152,6 +152,74 @@ def two_column_blocks(cells_rows, page_number):
     return pairs, used
 
 
+_LABELISH = re.compile(r"^[A-Za-z][A-Za-z0-9 /&.()'#%-]{1,39}$")
+
+
+def value_column_blocks(words, page_number):
+    """Two-column 'label | value' blocks without colons (the usual terms table in letters and term sheets).
+    The block is recognised by its value column: three or more rows whose second cell starts at the same x.
+    Labels may be left-aligned or centred; a value may run over several lines, with its label printed beside
+    any of them, so every value line is given to the nearest label. Returns (pairs, indexes of rows used)."""
+    rows = _rows_with_y(words)
+    def labelish(text):
+        t = text.strip()
+        return bool(_LABELISH.match(t)) and len(t.split()) <= 5 and ':' not in t
+    def is_pair(cells):
+        return len(cells) >= 2 and labelish(cells[0][2]) and not cells[1][2].lstrip().startswith(':')
+    two = [i for i, (y, cells, _) in enumerate(rows) if len(cells) == 2 and is_pair(cells)]
+    pairs, used, taken = [], set(), set()
+    for seed in two:
+        if seed in taken:
+            continue
+        v0 = rows[seed][1][1][0]
+        at_v = lambda cells: any(abs(c[0] - v0) <= 8 for c in cells)
+        # Rows that touch the value column, in order; the block is the run around the seed with no big vertical gap.
+        anchors = [i for i, (y, cells, _) in enumerate(rows) if at_v(cells)]
+        pos = anchors.index(seed)
+        lo = hi = pos
+        while lo > 0 and rows[anchors[lo]][0] - rows[anchors[lo - 1]][0] <= 45: lo -= 1
+        while hi + 1 < len(anchors) and rows[anchors[hi + 1]][0] - rows[anchors[hi]][0] <= 45: hi += 1
+        block = anchors[lo:hi + 1]
+        run = [i for i in block if is_pair(rows[i][1]) and abs(rows[i][1][1][0] - v0) <= 8]
+        if sum(1 for i in run if len(rows[i][1]) == 2) < 3:
+            continue
+        top, bottom = rows[block[0]][0] - 14, rows[block[-1]][0] + 14
+        labels, values, members = [], [], set(run)
+        for i in run:
+            labels.append([rows[i][0], rows[i][1][0][2].strip()])
+            values.append((rows[i][0], ' '.join(c[2].strip() for c in rows[i][1][1:])))
+        for i, (y, cells, _) in enumerate(rows):
+            if i in members or not top <= y <= bottom:
+                continue
+            if cells[0][0] >= v0 - 8:                            # a further line of a value (anything inside the value column)
+                values.append((y, ' '.join(c[2].strip() for c in cells))); members.add(i)
+            elif len(cells) == 1 and cells[0][1] < v0 and labelish(cells[0][2]):   # a label printed beside a multi-line value
+                labels.append([y, cells[0][2].strip()]); members.add(i)
+        labels.sort()
+        owned = {n: [] for n in range(len(labels))}
+        for y, text in sorted(values):
+            n = min(range(len(labels)), key=lambda k: abs(labels[k][0] - y))
+            if abs(labels[n][0] - y) <= 24: owned[n].append(text)
+        for n, (y, label) in enumerate(labels):
+            if owned[n]:
+                pairs.append({'label': _clean(label), 'value': _clean(' '.join(owned[n])), 'page': page_number})
+        used |= members; taken |= set(run)
+    return pairs, used
+
+
+_DASH_PAIR = re.compile(r"^([A-Za-z][A-Za-z .']{1,28}\b(?:no|number|log|id|ref|code)\.?)\s+[-–]\s+([A-Za-z0-9][\w/.-]{0,30})$", re.I)
+
+
+def dash_pairs(words, page_number):
+    """'Deal Log - 20371', 'Facility No. - 47': an identifier label, a dash, a short value."""
+    out = []
+    for y, cells, _ in _rows_with_y(words):
+        for c in cells:
+            m = _DASH_PAIR.match(c[2].strip())
+            if m: out.append({'label': _clean(m.group(1)), 'value': m.group(2), 'page': page_number})
+    return out
+
+
 def layout_key_values(words, page_number, skip=frozenset()):
     rows = _cells_from_words(words)
     results = []
@@ -256,9 +324,12 @@ def heading_values(words, page_number):
 def key_values_from_words(words, page_number):  # noqa: F811  (supersedes the colon-only version above)
     text_rows, cell_rows = _rows_from_words(words), _cells_from_words(words)
     block_pairs, used = two_column_blocks(cell_rows, page_number)
+    column_pairs, column_used = value_column_blocks(words, page_number)
+    block_pairs = block_pairs + [kv for kv in column_pairs if not any(kv['label'].lower() == b['label'].lower() for b in block_pairs)]
+    used = used | column_used
     rest = [t for idx, t in enumerate(text_rows) if idx not in used]
     seen, out = set(), []
-    for kv in block_pairs + extract_key_values(rest, page_number) + layout_key_values(words, page_number, used) + heading_values(words, page_number):
+    for kv in block_pairs + extract_key_values(rest, page_number) + layout_key_values(words, page_number, used) + heading_values(words, page_number) + dash_pairs(words, page_number):
         key = (kv['label'].lower(), kv['value'].lower())
         if key not in seen:
             seen.add(key); out.append(kv)
@@ -312,7 +383,7 @@ def unmapped_cells(words, page_number, key_values, tables, financial=None):
     used.update(str(n) for n in range(1, len(page_items) + 1))   # serial-number column
     from app.financial import _column_key
     out = []
-    for row in _cells_from_words(words):
+    for row_y, row, _ in _rows_with_y(words):
         for x0, x1, text in row:
             toks = _tokens(text)
             if not toks:
@@ -321,5 +392,5 @@ def unmapped_cells(words, page_number, key_values, tables, financial=None):
                 continue
             if (text.strip().endswith(':') and len(text) <= 45) or BOILERPLATE.match(text.strip()):   # heading / form wording with nothing of its own to report
                 continue
-            out.append({'page': page_number, 'text': _clean(text)})
+            out.append({'page': page_number, 'text': _clean(text), 'y': row_y, 'x0': x0})
     return out

@@ -102,7 +102,7 @@ def test_non_invoice_returns_generic_fields(samples):
     data = run(samples, 'letter')
     assert data['document_metadata']['document_category'] == 'sanction_letter'
     assert data['extracted_fields']['loan_amount'] == 'INR 2,50,00,000'
-    assert any('drawdown' in u['text'] for u in data['unmapped_text'])
+    assert any('drawdown' in u['text'] for u in data['text_content'])   # the paragraph comes back joined, in reading order
 
 
 def test_tax_label_needs_its_own_amount():
@@ -133,3 +133,45 @@ def test_table_without_grid_and_two_line_headings():
     table = detect_tables(words, 1)[0]
     assert table['columns'] == ['Sr. No.', 'Trade Ref', 'Order Type', 'Amount (Cr.)']
     assert table['rows'][1] == {'sr_no': '2', 'trade_ref': 'TREP/150626', 'order_type': 'Borrow', 'amount_cr': '40.00'}
+
+
+def _row(y, *cells):
+    words = []
+    for x, text in cells:
+        for part in text.split(' '):
+            words.append((x, y, x + 5 * len(part), y + 8, part, y, 0, 0)); x += 5 * len(part) + 3
+    return words
+
+
+def test_label_value_table_without_colons():
+    """Terms table of a letter: centred labels, no colons, one value over two lines with its label beside the middle."""
+    from app.generic_fields import key_values_from_words
+    words = (_row(100, (60, 'Drawdown Date'), (200, '24-06-2026'))
+             + _row(125, (50, 'Rate of Interest'), (200, '8.20% (Linked to 1M MCLR)'))
+             + _row(150, (70, 'Purpose'), (200, 'Working Capital Purposes'))
+             + _row(170, (200, 'Minimum tenor shall be 7 days; option to prepay'))
+             + _row(177, (45, 'Prepayment Penalty'))
+             + _row(184, (200, 'without penalty after 7 days.')))
+    got = {kv['label']: kv['value'] for kv in key_values_from_words(words, 1)}
+    assert got['Drawdown Date'] == '24-06-2026' and got['Rate of Interest'].startswith('8.20%')
+    assert got['Prepayment Penalty'] == 'Minimum tenor shall be 7 days; option to prepay without penalty after 7 days.'
+
+
+def test_tilted_scan_is_straightened():
+    """On a scan tilted by about one degree a label and its value sit several points apart vertically."""
+    from app.extractor import straighten
+    from app.generic_fields import _rows_from_words
+    tilted = []
+    for n in range(8):
+        y = 100 + n * 20
+        tilted += [(40, y, 100, y + 9, f'Label{n}', n, 0, 0), (400, y - 7, 460, y + 2, f'value{n}', n, 0, 1)]
+    assert len(_rows_from_words(tilted)) == 16            # before: every label and value on its own row
+    assert len(_rows_from_words(straighten(tilted))) == 8  # after: one row per printed line
+
+
+def test_letter_parts():
+    from app.letters import letter_parts
+    words = (_row(100, (30, '24 June, 2026')) + _row(112, (30, 'To')) + _row(124, (30, 'Example Bank')) + _row(136, (30, 'Chennai'))
+             + _row(170, (30, 'Subject - Drawdown of Working Capital Demand Loan')))
+    parts, _ = letter_parts(words, 800)
+    assert parts == {'date': '2026-06-24', 'addressed_to': ['Example Bank', 'Chennai'], 'subject': 'Drawdown of Working Capital Demand Loan'}
