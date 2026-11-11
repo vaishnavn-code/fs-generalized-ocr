@@ -78,6 +78,15 @@ def build_response(extraction, filename, include_raw=False):
         "warnings": warnings,
         "processing": {"page_sources": [{"page": p["page"], "source": p["source"]} for p in pages], "timings_ms": extraction.get("timings_ms"), "total_ms": extraction.get("total_ms")},
     }
+    generalized = extraction.get("generalized")
+    if kind == "tax_invoice" and generalized:
+        # Compact, generalized invoice JSON (header / tables / tax breakdown / footer).
+        data = {
+            **generalized,
+            "validation": data["validation"],
+            "warnings": [w for w in warnings if not w.startswith("Scanned table cell")],
+            "processing": data["processing"],
+        }
     if include_raw:
         data["raw_content"] = {"pages": pages, "tables": extraction.get("tables", []), "legacy_fields": extraction.get("fields", {})}
     return {"success": True, "message": "PDF extracted successfully", "data": data}

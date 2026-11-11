@@ -239,3 +239,289 @@ def extract_from_text(text):
         items.append({'description': m.group(2), 'hsn_sac': m.group(3), 'quantity': None, 'rate': None,
                       'gst_rate_percent': float(pct.group(1)) if pct else None, 'amount': v[-1]})
     return meta, totals, items
+
+
+
+# =====================================================================================
+# Generalized invoice JSON: header / tables / tax breakdown / footer.
+# Layout-based (word positions), no supplier-specific templates, no external AI.
+# =====================================================================================
+_ROW_TOL = 3.0
+_CELL_GAP = 8.0
+_MONEY = re.compile(r'^[₹\s]*(?:Rs\.?|INR)?\s*\(?-?\s*[\d,]+\.\d{2}\)?$', re.I)
+_PCT = re.compile(r'(\d+(?:\.\d+)?)\s*%')
+_PARTY_HEAD = re.compile(r'^(?:buyer|bill(?:ed)?\s*to|consignee|ship(?:ped)?\s*to|sold\s*to)\b', re.I)
+_TAX_ID_LABEL = re.compile(r'\b(?:vat|cst|pan|tan|gstin|gst|cin|tin|msme|udyam|fssai|iec)\b', re.I)
+_EOE = re.compile(r'\bE\.?\s*&\s*O\.?E\.?\b', re.I)
+
+
+def _gkey(text):
+    """Sanitised key: lowercase, '&'->'and', apostrophes dropped, 'A/c'->'ac', other symbols -> '_'."""
+    s = str(text or '').lower().replace('&', ' and ').replace("'", '').replace('’', '')
+    s = re.sub(r'\b([a-z])/([a-z])\b', r'\1\2', s)
+    return re.sub(r'[^a-z0-9]+', '_', s).strip('_')
+
+
+def _money_text(text):
+    return re.sub(r'^(?:₹|Rs\.?|INR)\s*', '', clean(text), flags=re.I)
+
+
+def _word_rows(words):
+    rows = []
+    for w in sorted(words, key=lambda w: ((w[1] + w[3]) / 2, w[0])):
+        yc = (w[1] + w[3]) / 2
+        if rows and abs(rows[-1]['y'] - yc) <= _ROW_TOL:
+            rows[-1]['w'].append((w[0], w[2], w[4]))
+        else:
+            rows.append({'y': yc, 'w': [(w[0], w[2], w[4])]})
+    for r in rows:
+        r['w'].sort()
+        cells = []
+        for x0, x1, t in r['w']:
+            if cells and x0 - cells[-1][1] <= _CELL_GAP:
+                cells[-1] = (cells[-1][0], x1, cells[-1][2] + ' ' + t)
+            else:
+                cells.append((x0, x1, t))
+        r['c'] = cells
+    return rows
+
+
+def _label_like(text):
+    t = text.strip()
+    return bool(t) and not re.search(r'\d', t) and not t.endswith(':') and 1 <= len(t.split()) <= 5 and len(t) <= 40 and t[0].isalpha()
+
+
+def _split_pairs(line):
+    """'State Name : Maharashtra, Code : 27' -> [('State Name','Maharashtra'),('Code','27')]; None if not key/value."""
+    line = clean(line)
+    parts = re.split(r',\s+(?=[A-Za-z][A-Za-z ]{0,20}\s*:\s)', line)
+    pairs = []
+    for p in parts:
+        m = re.match(r"^([A-Za-z][^:]{0,38}?)\s*:\s*(.+)$", p.strip())
+        if not m or len(m.group(1).split()) > 5:
+            return None
+        pairs.append((clean(m.group(1)), clean(m.group(2))))
+    return pairs
+
+
+def _add_field(store, label, value):
+    key = _gkey(label)
+    if not key:
+        return
+    if key == 'code' and 'state_name' in store:
+        key = 'state_code'
+    base, n = key, 2
+    while key in store:
+        key, n = f'{base}_{n}', n + 1
+    store[key] = value
+
+
+def _party(lines):
+    """Lines of one party block -> {name, address_lines, extracted_fields}."""
+    name, address, fields = None, [], {}
+    for line in lines:
+        pairs = _split_pairs(line)
+        if pairs and not any(re.search(r'\b(?:office|address|regd)\b', k, re.I) for k, _ in pairs):
+            for k, v in pairs:
+                _add_field(fields, k, v)
+            continue
+        m = re.match(r'^([A-Za-z]{2,10})\s*-\s+(\S.*\d.*)$', line)   # 'MSME- UDYAM-MH-18-0237095'
+        if m:
+            _add_field(fields, m.group(1), m.group(2))
+            continue
+        if name is None:
+            name = re.sub(r'\s+from\s+\d{1,2}-[A-Za-z]{3}-\d{2,4}$', '', line)
+        else:
+            address.append(re.sub(r'\s*:\s*', ' ', line) if pairs else line)
+    return {'name': name, 'address_lines': address, 'extracted_fields': fields}
+
+
+def _generalized_items(rows, h):
+    """Parse the line-item table whose header row is rows[h]. Returns (table, index_of_total_row)."""
+    cols = [list(c) for c in rows[h]['c']]
+    start = h + 1
+    # Header split over two lines (e.g. 'Sl' / 'No.'): merge short non-numeric, x-aligned cells.
+    if start < len(rows):
+        nxt = rows[start]['c']
+        if nxt and all(not re.search(r'\d', c[2]) and len(c[2].split()) <= 2 for c in nxt) \
+                and all(any(abs(c[0] - col[0]) <= 15 for col in cols) for c in nxt):
+            for c in nxt:
+                col = min(cols, key=lambda k: abs(k[0] - c[0]))
+                col[2] += ' ' + c[2]
+            start += 1
+    keys = []
+    for i, c in enumerate(cols):
+        base = _gkey(c[2]) or f'column_{i + 1}'
+        key, n = base, 2
+        while key in keys:
+            key, n = f'{base}_{n}', n + 1
+        keys.append(key)
+    bounds = [(cols[i][1] + cols[i + 1][0]) / 2 for i in range(len(cols) - 1)]
+    serial_col = bool(re.match(r'^(?:sl|s\.?\s*no|sr|#)', cols[0][2], re.I))
+    desc_i = next((i for i, k in enumerate(keys) if 'description' in k or 'particular' in k or k.startswith('item')), 1 if serial_col else 0)
+    qty_i = next((i for i, k in enumerate(keys) if 'quantity' in k or k == 'qty'), None)
+    amt_i = next((i for i in range(len(keys) - 1, -1, -1) if 'amount' in keys[i]), None)
+    desc_limit = bounds[desc_i] if desc_i < len(bounds) else 1e9
+
+    def col_of(cx):
+        return next((i for i, b in enumerate(bounds) if cx < b), len(cols) - 1)
+
+    def assign(row, first_is_serial):
+        out = {}
+        for n, (x0, x1, t) in enumerate(row['w']):
+            i = col_of((x0 + x1) / 2)
+            if serial_col and not (n == 0 and first_is_serial):
+                i = max(i, 1)
+            out[i] = (out.get(i, '') + ' ' + t).strip()
+        return out
+
+    items, summary, total_row = [], {}, None
+    for r in range(start, len(rows)):
+        row = rows[r]
+        texts = [c[2].strip() for c in row['c']]
+        if any(t.lower() == 'total' for t in texts):
+            cells = assign(row, False)
+            if qty_i is not None and cells.get(qty_i):
+                summary['total_quantity'] = cells[qty_i]
+            if amt_i is not None and cells.get(amt_i):
+                summary['total_amount'] = _money_text(cells[amt_i])
+            total_row = r
+            break
+        first = row['w'][0][2] if row['w'] else ''
+        # An item row starts with a serial number AND has values right of the description (HSN/qty/rate/amount);
+        # a description line such as '2 YEAR WARRANTY' has neither.
+        is_item = bool(serial_col and re.fullmatch(r'\d{1,3}', first) and len(row['w']) > 1
+                       and any(i > desc_i for i in assign(row, True)))
+        summary_label = re.match(r'^(?:cgst|sgst|igst|utgst|cess|round\s*off|less|add|discount|freight)', ' '.join(texts), re.I)
+        if is_item:
+            cells = assign(row, True)
+            items.append({keys[i]: v for i, v in sorted(cells.items())})
+        elif items and not summary_label and all((c[0] + c[1]) / 2 < desc_limit for c in row['c']):
+            items[-1][keys[desc_i]] = clean(items[-1].get(keys[desc_i], '') + ' ' + ' '.join(texts))
+        elif items:
+            money = [t for t in texts if _MONEY.match(t)]
+            label = next((t for t in texts if not _MONEY.match(t) and not re.fullmatch(r'[\d.]+\s*%', t)), None)
+            if not money:
+                continue
+            if label:
+                pct = _PCT.search(label) or next((_PCT.search(t) for t in texts if re.fullmatch(r'[\d.]+\s*%', t)), None)
+                base = _gkey(_PCT.sub('', label)) or 'tax'
+                if pct:
+                    summary[f'{base}_rate'] = pct.group(1) + '%'
+                summary[f'{base}_amount'] = _money_text(money[-1])
+            else:
+                summary['subtotal_amount'] = _money_text(money[-1])
+    order = [k for k in summary if not k.startswith('total_')] + [k for k in summary if k.startswith('total_')]
+    return {'table_name': 'line_items_table', 'columns': keys, 'rows': items, 'table_totals': {k: summary[k] for k in order}}, total_row
+
+
+def _generalized_tax_table(rows, t_h):
+    """HSN/tax summary table: header row t_h plus optional sub-header row. Returns (table, last_row_index)."""
+    tops = rows[t_h]['c']
+    subs = rows[t_h + 1]['c'] if t_h + 1 < len(rows) else []
+    use_subs = len(subs) >= 2 and all(not re.search(r'\d', c[2]) for c in subs)
+    centre = lambda c: (c[0] + c[1]) / 2
+    cols = []   # (key, x-centre)
+    if use_subs:
+        owner = {id(s): min(tops, key=lambda t: abs(centre(t) - centre(s))) for s in subs}
+        used = {id(o) for o in owner.values()}
+        cols += [(_gkey(t[2]), centre(t)) for t in tops if id(t) not in used]
+        cols += [(_gkey(owner[id(s)][2] + ' ' + s[2]), centre(s)) for s in subs]
+        data_start = t_h + 2
+    else:
+        cols = [(_gkey(t[2]), centre(t)) for t in tops]
+        data_start = t_h + 1
+    cols.sort(key=lambda c: c[1])
+    data, totals, end = [], {}, data_start - 1
+    for r in range(data_start, len(rows)):
+        row = rows[r]
+        if re.search(r'in words|bank details|declaration', ' '.join(c[2] for c in row['c']), re.I):
+            break
+        end = r
+        cells = {}
+        for x0, x1, t in row['w']:
+            if t.lower() == 'total':
+                continue
+            key = min(cols, key=lambda c: abs(c[1] - (x0 + x1) / 2))[0]
+            cells[key] = (cells.get(key, '') + ' ' + t).strip()
+        if any(w[2].lower() == 'total' for w in row['w']):
+            totals = {(k if k.startswith('total') else 'total_' + k): v for k, v in cells.items()}
+            break
+        if len(cells) >= 2:
+            data.append({c[0]: cells[c[0]] for c in cols if c[0] in cells})
+    return {'columns': [c[0] for c in cols], 'rows': data, 'totals': totals}, end
+
+
+def generalized_invoice(page):
+    """Build the generalized invoice JSON from one PyMuPDF page. Returns None if no line-item table is found."""
+    rows = _word_rows(page.get_text('words'))
+    if not rows:
+        return None
+
+    def is_item_header(r):
+        t = ' '.join(c[2] for c in r['c']).lower()
+        return sum(k in t for k in ('description', 'hsn', 'quantity', 'rate', 'amount', 'particular')) >= 3
+
+    h = next((i for i, r in enumerate(rows) if is_item_header(r)), None)
+    if h is None:
+        return None
+    result = {'document_type': clean(' '.join(c[2] for c in rows[0]['c'])).upper() or None}
+
+    # ---- header: left column = seller then buyer; right column = label/value grid ----
+    anchor = next((c for r in rows[:h] for c in r['c'] if re.match(r'^invoice\s*(?:no|number)', c[2], re.I)), None)
+    split = (anchor[0] if anchor else page.rect.width * 0.5) - 5
+    left, right = [], []
+    for ri in range(1, h):
+        lc = [c for c in rows[ri]['c'] if c[0] < split]
+        if lc:
+            left.append(clean(' '.join(c[2] for c in lc)))
+        right += [(ri, c[0], c[1], c[2]) for c in rows[ri]['c'] if c[0] >= split]
+    cut = next((i for i, l in enumerate(left) if _PARTY_HEAD.match(l)), None)
+    seller_lines, buyer_lines = (left[:cut], left[cut + 1:]) if cut is not None else (left, [])
+    metadata = {}
+    for ri, x0, x1, text in right:
+        if not _label_like(text):
+            continue
+        value = next((u for rj, y0, y1, u in right if ri < rj <= ri + 3 and abs(y0 - x0) <= 12 and not _label_like(u)), None)
+        _add_field(metadata, text, value)
+    result['header_details'] = {'seller': _party(seller_lines), 'buyer': _party(buyer_lines), 'invoice_metadata': metadata}
+
+    # ---- tables ----
+    items_table, total_row = _generalized_items(rows, h)
+    result['tables'] = [items_table]
+    after = (total_row if total_row is not None else h) + 1
+    t_h = next((i for i in range(after, len(rows)) if any('taxable' in c[2].lower() for c in rows[i]['c'])), None)
+    end = after
+    if t_h is not None:
+        result['tax_breakdown_table'], end = _generalized_tax_table(rows, t_h)
+    else:
+        result['tax_breakdown_table'] = {'columns': [], 'rows': [], 'totals': {}}
+
+    # ---- footer ----
+    footer, bank, ids, declaration, section = {}, {}, {}, [], None
+    for i in range(min(after, end + 1), len(rows)):
+        cells = rows[i]['c']
+        left_text = clean(' '.join(c[2] for c in cells if c[0] < split))
+        for c in cells:
+            if re.search(r'\bin\s+words\b', c[2], re.I):
+                pairs = _split_pairs(c[2])
+                if pairs:
+                    footer[_gkey(_EOE.sub('', pairs[0][0]))] = pairs[0][1]
+                elif i + 1 < len(rows) and rows[i + 1]['c']:
+                    footer[_gkey(_EOE.sub('', c[2]))] = clean(rows[i + 1]['c'][0][2])
+        if re.search(r'bank details', left_text, re.I):
+            section = 'bank'
+            continue
+        if re.fullmatch(r'declaration:?', left_text, re.I):
+            section = 'declaration'
+            continue
+        if section == 'declaration':
+            if not left_text or re.search(r'authori[sz]ed|signator|computer generated|^for\b', left_text, re.I):
+                section = None
+            else:
+                declaration.append(left_text)
+        elif section == 'bank' and left_text:
+            for k, v in _split_pairs(left_text) or []:
+                _add_field(ids if _TAX_ID_LABEL.search(k) else bank, k, v)
+    result['footer_details'] = {**footer, 'company_bank_details': bank, 'company_tax_ids': ids, 'declaration': ' '.join(declaration) or None}
+    return result

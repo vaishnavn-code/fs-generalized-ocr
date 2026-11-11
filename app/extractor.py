@@ -7,9 +7,9 @@ import pdfplumber
 import pytesseract
 from PIL import Image
 from app.generic_fields import key_values_from_words, key_values_from_text, supplier_from_signature
-from app.financial import extract_metadata, extract_items, extract_totals, normalize_table, identify_table, validate, totals_from_tables, extract_from_text
+from app.financial import extract_metadata, extract_items, extract_totals, normalize_table, identify_table, validate, totals_from_tables, extract_from_text, generalized_invoice
 
-MAX_PAGES = 5
+MAX_PAGES = 50
 
 
 def _configure_tesseract():
@@ -47,6 +47,7 @@ def extract_pdf(pdf_bytes, dpi=150):
     totals = {}
     key_values = []
     signature_supplier = None
+    generalized = None
     with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
         if doc.needs_pass:
             raise ValueError('Password-protected PDFs are not supported')
@@ -58,6 +59,10 @@ def extract_pdf(pdf_bytes, dpi=150):
             if number == 1:
                 metadata = extract_metadata(page)
                 totals = extract_totals(page)
+                try:
+                    generalized = generalized_invoice(page)
+                except Exception:   # never let the new layout parser break extraction
+                    generalized = None
             t = time.perf_counter()
             native = page.get_text('text', sort=True)
             word_count = len(page.get_text('words'))
@@ -106,7 +111,7 @@ def extract_pdf(pdf_bytes, dpi=150):
         financial['taxable_amount_source'] = 'derived_from_total_and_tax'
     financial['validation'] = validate(financial, items)
     return {
-        'financial': financial, 'key_value_pairs': key_values,
+        'financial': financial, 'generalized': generalized, 'key_value_pairs': key_values,
         'status': 'completed', 'page_count': len(pages), 'pages': pages,
         'fields': {**fields_from_text('\n'.join(p['text'] for p in pages)), 'date': financial.get('invoice_date')},
         'tables': tables, 'warnings': (['Scanned table cell reconstruction is not implemented in this POC'] if ocr_pages else []) + ocr_warnings,
