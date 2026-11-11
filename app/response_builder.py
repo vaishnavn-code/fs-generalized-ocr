@@ -65,6 +65,7 @@ def build_response(extraction, filename, include_raw=False):
             "document_date": financial.get("invoice_date") if kind == "tax_invoice" else None,
         },
         "extracted_fields": fields,
+        "all_fields": extraction.get("key_value_pairs", []),
         "tables": structured_tables,
         "validation": financial.get("validation", {"status": "not_verified", "checks": {}}),
         "warnings": warnings,

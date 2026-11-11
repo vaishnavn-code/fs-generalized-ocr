@@ -180,3 +180,62 @@ def totals_from_tables(tables, existing):
     if 'gst_amount' not in result and 'cgst' in result and 'sgst' in result:
         result['gst_amount']=round(result['cgst']+result['sgst'],2)
     return result
+
+
+def extract_from_text(text):
+    """Layout-free fallback for OCR text (scanned invoices). Returns (metadata, totals, items).
+    Only labelled/structurally-recognisable values are returned; anything else stays None."""
+    meta = {'invoice_number': None, 'invoice_date': None, 'supplier': None}
+    totals, items = {}, []
+    lines = [clean(l) for l in text.splitlines()]
+    lines = [l for l in lines if l]
+
+    # Invoice number + date: first invoice-id-like token (letters + digits + separators) after an 'Invoice No' label.
+    label = re.search(r'Invoice\s*(?:No\.?|Number)', text, re.I)
+    if label:
+        window = text[label.end():label.end() + 300]
+        for m in re.finditer(r'\b(?=[A-Z0-9/-]*\d)(?=[A-Z0-9/-]*[A-Z])[A-Z0-9]+(?:[/-][A-Z0-9]+)+\b', window):
+            if DATE.fullmatch(m.group()): continue
+            meta['invoice_number'] = m.group()
+            d = DATE.search(window[m.end():m.end() + 80]) or DATE.search(window)
+            meta['invoice_date'] = valid_date(d.group()) if d else None
+            break
+
+    # Supplier: 'for <Company>' signature line, else account-holder name.
+    for l in lines:
+        m = re.match(r'^for\s+([A-Za-z][\w&.,\' -]{2,70})$', l, re.I)
+        if m: meta['supplier'] = m.group(1).strip(); break
+    if not meta['supplier']:
+        m = re.search(r"Holder'?s Name\s*[:=-]\s*([^\n]+)", text, re.I)
+        if m: meta['supplier'] = clean(m.group(1))
+
+    amounts = lambda s: [number(a.group(0)) for a in AMOUNT.finditer(s)]
+    for l in lines:
+        # Tax summary row: Total: taxable cgst sgst total_tax (or taxable igst total_tax)
+        if re.match(r'^Total\s*:', l, re.I) and 'taxable_amount' not in totals:
+            v = amounts(l)
+            if len(v) >= 4 and abs(v[1] + v[2] - v[3]) <= 0.02:
+                totals.update(taxable_amount=v[0], cgst=v[1], sgst=v[2], gst_amount=v[3])
+            elif len(v) == 3 and abs(v[1] - v[2]) <= 0.02:
+                totals.update(taxable_amount=v[0], igst=v[1], gst_amount=v[2])
+        # Grand total: a line that is only 'Total' and one amount.
+        m = re.match(r'^Total\s*[=:]?\s*(?:₹|Rs\.?)?\s*([\d,]+\.\d{2})$', l, re.I)
+        if m and 'invoice_total' not in totals: totals['invoice_total'] = number(m.group(1))
+        m = re.match(r'^(CGST|SGST|IGST)\b.*?([\d,]+\.\d{2})$', l, re.I)
+        if m and m.group(1).lower() not in totals: totals[m.group(1).lower()] = number(m.group(2))
+        m = re.match(r'^Round\s*Off\b.*?(-?\s*[\d,]+\.\d{2})$', l, re.I)
+        if m: totals['round_off'] = number(m.group(1))
+    # The tax-summary 'Total:' row's own total-tax value must not be mistaken for the invoice total.
+    if totals.get('invoice_total') == totals.get('gst_amount'): totals.pop('invoice_total')
+
+    # Line items: '<sl> <description> <HSN/SAC> [gst%] [qty] [rate] <amount>'
+    for l in lines:
+        m = re.match(r'^(\d{1,3})\s+(.+?)\s+(\d{4,8})\s+(.+)$', l)
+        if not m: continue
+        tail = m.group(4)
+        v = amounts(tail)
+        if not v: continue
+        pct = re.search(r'(\d{1,2}(?:\.\d+)?)\s*%', tail)
+        items.append({'description': m.group(2), 'hsn_sac': m.group(3), 'quantity': None, 'rate': None,
+                      'gst_rate_percent': float(pct.group(1)) if pct else None, 'amount': v[-1]})
+    return meta, totals, items
